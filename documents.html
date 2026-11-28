@@ -575,21 +575,7 @@
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-app.js";
-        const { getDatabase, ref, get, readView } = await import("./data.js?v=permissions-1").catch(async error => {
-            console.warn("Shared data module unavailable; using Firebase directly.", error);
-            const sdk = await import("./data.js?v=permissions-1");
-            return {
-                ...sdk,
-                get: (...args) => window.AdminLoading.track(sdk.get(...args)),
-                cachedOnValue: (...args) => window.AdminLoading.listen(sdk.onValue, ...args),
-                readView: render => render(),
-                replayingReads: () => false,
-                monthlyRecords: db => Promise.all([
-                    sdk.get(sdk.ref(db, "attendance")),
-                    sdk.get(sdk.ref(db, "salary_approvals"))
-                ])
-            };
-        });
+        const { getDatabase, ref, get, readView } = await import("./data.js?v=permissions-1");
 
         const firebaseConfig = {
             apiKey: "AIzaSyADjMc3Jwsjlg_ajo282ZtM5jvDUuGdoRk",
@@ -644,23 +630,34 @@
             return allowedTokens;
         }
 
-        function getEmployeeDocuments(docsMap, employeeId) {
-            const rawEmpId = (employeeId || "").toString().trim();
-            if (!rawEmpId) return [];
+        async function getEmployeeDocuments(employeeId) {
+            const rawId = employeeId.trim();
+            const safeId = rawId.replace(/[.#$\[\]\/]/g, "_");
+            if (!safeId) return [];
+            const docs = (await get(ref(db, "documents/" + safeId))).val();
+            return Object.values(docs || {})
+                .filter(doc => doc && typeof doc === "object")
+                .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+        }
 
-            const sanitizedId = rawEmpId.replace(/[.#$\[\]]/g, '_');
-            const candidateKeys = [sanitizedId, rawEmpId];
-
-            for (const key of candidateKeys) {
-                const docValue = docsMap[key];
-                if (docValue && typeof docValue === 'object') {
-                    return Object.values(docValue)
-                        .filter(doc => doc && typeof doc === 'object')
-                        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-                }
+        function addDocument(list, doc) {
+            const row = document.createElement("div");
+            row.className = "document-item";
+            row.innerHTML = '<div class="doc-details"><div><div class="doc-name"></div><div class="doc-meta"></div></div></div><div class="doc-actions"></div>';
+            const name = row.querySelector(".doc-name");
+            name.textContent = doc.name || "Document";
+            name.title = name.textContent;
+            row.querySelector(".doc-meta").textContent = new Date(doc.timestamp || 0).toLocaleDateString() + " ? " + formatBytes(doc.size);
+            if (/^(https?:\/\/|data:(?:application\/(?:pdf|octet-stream)|image\/(?:png|jpeg|webp|gif));base64,)/i.test(doc.url || "")) {
+                const link = document.createElement("a");
+                link.href = doc.url;
+                link.target = "_blank";
+                link.rel = "noopener";
+                link.download = doc.name || "document";
+                link.textContent = "View";
+                row.querySelector(".doc-actions").append(link);
             }
-
-            return [];
+            list.append(row);
         }
 
         function formatBytes(bytes) {
@@ -678,9 +675,8 @@
             const companyId = localStorage.getItem("companyId");
 
             try {
-                const [employeesSnap, docsSnap, branchesSnap] = await Promise.all([
+                const [employeesSnap, branchesSnap] = await Promise.all([
                     get(ref(db, "employees")),
-                    get(ref(db, "documents")),
                     get(ref(db, "branches"))
                 ]);
 
@@ -692,7 +688,6 @@
                     return;
                 }
 
-                const docsMap = docsSnap.exists() ? docsSnap.val() : {};
                 const allowedBranchTokens = buildAllowedBranchTokens(branchesSnap, adminBranch);
                 const sessionCompanyId = normalizeValue(companyId);
 
@@ -705,35 +700,6 @@
                     if ((role === 'branch_admin' || role === 'sub_admin') && !allowedBranchTokens.has(empBranch)) return;
                     if ((role === 'company_admin' || role === 'super_admin') && empCompanyId !== sessionCompanyId) return;
 
-                    const empDocs = getEmployeeDocuments(docsMap, empId);
-
-                    let docsHtml = '';
-                    if (empDocs.length === 0) {
-                        docsHtml = '<div class="no-docs">No documents uploaded</div>';
-                    } else {
-                        empDocs.forEach(doc => {
-                            const d = new Date(doc.timestamp || 0);
-                            const dateStr = `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()}`;
-                            const isPdf = (doc.type || '').toString().toLowerCase() === 'pdf';
-                            const icon = isPdf ? '📄' : '🖼️';
-
-                            docsHtml += `
-                                <div class="document-item">
-                                    <div class="doc-details">
-                                        <span class="doc-icon">${icon}</span>
-                                        <div>
-                                            <div class="doc-name" title="${doc.name || 'Document'}">${doc.name || 'Document'}</div>
-                                            <div class="doc-meta">${dateStr} • ${formatBytes(doc.size)}</div>
-                                        </div>
-                                    </div>
-                                    <div class="doc-actions">
-                                        <a href="${doc.url}" target="_blank" download>View</a>
-                                    </div>
-                                </div>
-                            `;
-                        });
-                    }
-
                     const cardHtml = `
                         <div class="employee-card">
                             <div class="employee-card-header">
@@ -744,12 +710,30 @@
                                 </div>
                             </div>
                             <div style="display: flex; flex-direction: column; gap: 8px;">
-                                ${docsHtml}
+                                <button type="button" class="load-documents">Load documents</button>
+                                <div class="employee-documents"></div>
                             </div>
                         </div>
                     `;
 
                     container.insertAdjacentHTML('beforeend', cardHtml);
+                    const card = container.lastElementChild;
+                    const loadButton = card.querySelector(".load-documents");
+                    const list = card.querySelector(".employee-documents");
+                    loadButton.addEventListener("click", async () => {
+                        loadButton.disabled = true;
+                        list.textContent = "Loading documents?";
+                        try {
+                            const docs = await getEmployeeDocuments(empId);
+                            list.textContent = docs.length ? "" : "No documents uploaded";
+                            docs.forEach(doc => addDocument(list, doc));
+                            loadButton.remove();
+                        } catch (error) {
+                            list.textContent = "Unable to load documents.";
+                            loadButton.disabled = false;
+                            console.error(error);
+                        }
+                    });
                     count++;
                 });
 

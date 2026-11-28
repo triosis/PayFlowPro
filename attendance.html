@@ -778,21 +778,7 @@
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-app.js";
-        const { getDatabase, ref, set, cachedOnValue: onValue, remove, get, update } = await import("./data.js?v=permissions-1").catch(async error => {
-            console.warn("Shared data module unavailable; using Firebase directly.", error);
-            const sdk = await import("./data.js?v=permissions-1");
-            return {
-                ...sdk,
-                get: (...args) => window.AdminLoading.track(sdk.get(...args)),
-                cachedOnValue: (...args) => window.AdminLoading.listen(sdk.onValue, ...args),
-                readView: render => render(),
-                replayingReads: () => false,
-                monthlyRecords: db => Promise.all([
-                    sdk.get(sdk.ref(db, "attendance")),
-                    sdk.get(sdk.ref(db, "salary_approvals"))
-                ])
-            };
-        });
+        const { getDatabase, ref, set, cachedOnValue: onValue, remove, get, update, query, orderByKey, startAt, endAt } = await import("./data.js?v=permissions-1");
 
         const firebaseConfig = {
             apiKey: "AIzaSyADjMc3Jwsjlg_ajo282ZtM5jvDUuGdoRk",
@@ -1033,7 +1019,8 @@
         document.getElementById('filterToDate').value = today;
 
         // Load Emp List
-        onValue(ref(db, "admins"), adminsSnap => {
+        let stopEmployees;
+        const stopAdmins = onValue(ref(db, "admins"), adminsSnap => {
             const branchAdminBranches = new Set();
             if (adminsSnap.exists()) {
                 adminsSnap.forEach(a => {
@@ -1044,7 +1031,8 @@
                 });
             }
 
-            onValue(ref(db, "employees"), s => {
+            stopEmployees?.();
+            stopEmployees = onValue(ref(db, "employees"), s => {
                 allowedEmpIds.clear();
                 empOptionIds.length = 0;
 
@@ -1600,20 +1588,62 @@
             return rawStatus;
         }
 
-        // --- LISTENER ---
         let allAttendanceData = [];
+        const attendanceListeners = new Map();
+        let attendanceFrame = null;
 
-        onValue(ref(db, "attendance"), s => {
-            allAttendanceData = [];
-            if (s.exists()) {
-                s.forEach(emp => {
+        function showAttendanceRows() {
+            allAttendanceData = [...attendanceListeners.values()].flatMap(listener => listener.rows);
+            allAttendanceData.sort((a, b) => b.date.localeCompare(a.date));
+            renderCachedAttendance();
+        }
 
-                    emp.forEach(day => {
+        function queueAttendanceRender() {
+            if (attendanceFrame !== null) return;
+            attendanceFrame = requestAnimationFrame(() => {
+                attendanceFrame = null;
+                showAttendanceRows();
+            });
+        }
+
+        window.renderAttendanceTable = () => {
+            const rawEmployee = document.getElementById("filterEmpId").value.trim();
+            const resolved = resolveEmployeeId(rawEmployee, true);
+            const search = rawEmployee.toLowerCase();
+            const from = document.getElementById("filterFromDate").value;
+            const to = document.getElementById("filterToDate").value;
+            const start = from || to || today;
+            const end = to || from || today;
+            const paths = new Map();
+            if (employeesLoaded && start <= end) {
+                for (const empId of allowedEmpIds) {
+                    if (!empId || /[.#$\[\]\/]/.test(empId)) continue;
+                    if (resolved && !sameEmployeeRecord(empId, resolved)) continue;
+                    if (!resolved && search && !employeeAliasesForRecord(empId).some(alias =>
+                        [alias, employeeNameForId(alias), employeeOptionLabel(alias)].some(value =>
+                            value.toLowerCase().includes(search)))) continue;
+                    paths.set(JSON.stringify([empId, start, end]), empId);
+                }
+            }
+            for (const [key, listener] of attendanceListeners) {
+                if (paths.has(key)) continue;
+                listener.stop();
+                attendanceListeners.delete(key);
+            }
+            for (const [key, empId] of paths) {
+                if (attendanceListeners.has(key)) continue;
+                const listener = { rows: [], stop: null };
+                attendanceListeners.set(key, listener);
+                const days = query(ref(db, "attendance/" + empId), orderByKey(), startAt(start), endAt(end));
+                listener.stop = onValue(days, snapshot => {
+                    if (attendanceListeners.get(key) !== listener) return;
+                    const rows = [];
+                    snapshot.forEach(day => {
                         const r = day.val();
                         const rawStatus = r.status || '';
                         const status = normalizeAttendanceStatus(r, day.key);
-                        allAttendanceData.push({
-                            empId: emp.key,
+                        rows.push({
+                            empId,
                             date: day.key,
                             punchIn: r.punchIn?.time || "-",
                             punchOut: r.punchOut?.time || "-",
@@ -1625,11 +1655,20 @@
                             punchOutImg: r.punchOut?.imageBase64 || null
                         });
                     });
+                    listener.rows = rows;
+                    queueAttendanceRender();
                 });
             }
-            // Sort by Date Descending
-            allAttendanceData.sort((a, b) => new Date(b.date) - new Date(a.date));
-            renderAttendanceTable();
+            showAttendanceRows();
+        };
+
+        window.addEventListener("pagehide", event => {
+            if (event.persisted) return;
+            stopAdmins();
+            stopEmployees?.();
+            for (const listener of attendanceListeners.values()) listener.stop();
+            attendanceListeners.clear();
+            if (attendanceFrame !== null) cancelAnimationFrame(attendanceFrame);
         });
 
         window.viewImage = (base64, title) => {
@@ -1639,7 +1678,7 @@
             win.document.title = title;
         };
 
-        window.renderAttendanceTable = () => {
+        function renderCachedAttendance() {
             const filterEmpRaw = document.getElementById('filterEmpId').value.trim();
             const filterEmp = filterEmpRaw.toLowerCase();
             const resolvedFilterEmp = resolveEmployeeId(filterEmpRaw, true);
@@ -1815,8 +1854,8 @@
 
         window.clearFilters = () => {
             document.getElementById('filterEmpId').value = '';
-            document.getElementById('filterFromDate').value = '';
-            document.getElementById('filterToDate').value = '';
+            document.getElementById('filterFromDate').value = today;
+            document.getElementById('filterToDate').value = today;
             renderAttendanceTable();
         };
 

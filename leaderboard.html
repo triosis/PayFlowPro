@@ -515,21 +515,7 @@
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-app.js";
-        const { getDatabase, ref, get, readView } = await import("./data.js?v=permissions-1").catch(async error => {
-            console.warn("Shared data module unavailable; using Firebase directly.", error);
-            const sdk = await import("./data.js?v=permissions-1");
-            return {
-                ...sdk,
-                get: (...args) => window.AdminLoading.track(sdk.get(...args)),
-                cachedOnValue: (...args) => window.AdminLoading.listen(sdk.onValue, ...args),
-                readView: render => render(),
-                replayingReads: () => false,
-                monthlyRecords: db => Promise.all([
-                    sdk.get(sdk.ref(db, "attendance")),
-                    sdk.get(sdk.ref(db, "salary_approvals"))
-                ])
-            };
-        });
+        const { getDatabase, ref, get, readView, query, orderByKey, startAt, endAt } = await import("./data.js?v=permissions-1");
 
         const firebaseConfig = {
             apiKey: "AIzaSyADjMc3Jwsjlg_ajo282ZtM5jvDUuGdoRk",
@@ -737,6 +723,7 @@
 
         function loadLeaderboard() { return readView(refreshloadLeaderboard); }
         async function refreshloadLeaderboard() {
+            const requestedFilter = currentFilter;
             // Keep rankings visible during refresh.
 
             try {
@@ -745,9 +732,8 @@
                 const companyId = localStorage.getItem("companyId");
                 const settingsRoot = await resolveSettingsRoot(companyId, adminBranch);
 
-                const [empSnap, attSnap, branchesSnap, officeSnap, intSnap, woSnap, holSnap, ssSnap] = await Promise.all([
+                const [empSnap, branchesSnap, officeSnap, intSnap, woSnap, holSnap, ssSnap] = await Promise.all([
                     get(ref(db, "employees")),
-                    get(ref(db, "attendance")),
                     get(ref(db, "branches")),
                     get(ref(db, `${settingsRoot}/officeTime`)),
                     get(ref(db, `${settingsRoot}/intervals`)),
@@ -798,7 +784,6 @@
                 const ssData = ssSnap.exists() ? ssSnap.val() : false;
 
                 const employees = empSnap.val();
-                const attendance = attSnap.exists() ? attSnap.val() : {};
 
                 let results = [];
 
@@ -819,10 +804,15 @@
                     // Skip resigned employees from leaderboard
                     if (window.isResigned && window.isResigned(emp)) continue;
 
-                    const activeWorkingDays = getWorkingDays(currentFilter, weekOffs, ssData, holidays, emp.joiningDate);
+                    const activeWorkingDays = getWorkingDays(requestedFilter, weekOffs, ssData, holidays, emp.joiningDate);
 
                     let netMins = 0;
-                    const empAtt = attendance[empId] || {};
+                    const firstDay = activeWorkingDays[0];
+                    const lastDay = activeWorkingDays.at(-1);
+                    const empAtt = firstDay ? (await get(
+                        query(ref(db, "attendance/" + empId), orderByKey(), startAt(firstDay), endAt(lastDay)),
+                        firstDay + ":" + lastDay
+                    )).val() || {} : {};
 
                     activeWorkingDays.forEach(date => {
                         if (empAtt[date]) {
@@ -841,6 +831,10 @@
                     });
                 }
 
+                if (requestedFilter !== currentFilter) {
+                    setTimeout(loadLeaderboard, 0);
+                    return;
+                }
                 results.sort((a, b) => b.netMins - a.netMins);
 
                 let html = '';

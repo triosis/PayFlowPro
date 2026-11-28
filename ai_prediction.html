@@ -517,21 +517,7 @@
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-app.js";
-        const { getDatabase, ref, get, cachedOnValue: onValue, readView } = await import("./data.js?v=permissions-1").catch(async error => {
-            console.warn("Shared data module unavailable; using Firebase directly.", error);
-            const sdk = await import("./data.js?v=permissions-1");
-            return {
-                ...sdk,
-                get: (...args) => window.AdminLoading.track(sdk.get(...args)),
-                cachedOnValue: (...args) => window.AdminLoading.listen(sdk.onValue, ...args),
-                readView: render => render(),
-                replayingReads: () => false,
-                monthlyRecords: db => Promise.all([
-                    sdk.get(sdk.ref(db, "attendance")),
-                    sdk.get(sdk.ref(db, "salary_approvals"))
-                ])
-            };
-        });
+        const { getDatabase, ref, get, cachedOnValue: onValue, readView } = await import("./data.js?v=permissions-1");
 
         const firebaseConfig = {
             apiKey: "AIzaSyADjMc3Jwsjlg_ajo282ZtM5jvDUuGdoRk",
@@ -565,7 +551,7 @@
 
         // Cache data to avoid refetching on every change
         let cachedEmpData = null;
-        let cachedAttData = null;
+        const cachedAttendance = new Map();
         let cachedSettings = null;
         let cachedSettingsRoot = null;
 
@@ -722,18 +708,16 @@
             document.getElementById('resultsContainer').style.display = 'block';
 
             try {
-                if (!cachedSettings || !cachedAttData) {
+                if (!cachedSettings) {
                     const settingsRoot = cachedSettingsRoot || await resolveSettingsRoot(localStorage.getItem("companyId"), localStorage.getItem("branch"));
                     cachedSettingsRoot = settingsRoot;
-                    const [att, ot, int, wo, hol, ss] = await Promise.all([
-                        get(ref(db, "attendance")),
+                    const [ot, int, wo, hol, ss] = await Promise.all([
                         get(ref(db, `${settingsRoot}/officeTime`)),
                         get(ref(db, `${settingsRoot}/intervals`)),
                         get(ref(db, `${settingsRoot}/weekOffs`)),
                         get(ref(db, `${settingsRoot}/holidays`)),
                         get(ref(db, `${settingsRoot}/secondSaturday`))
                     ]);
-                    cachedAttData = att.exists() ? att.val() : {};
                     const holidaySet = new Set();
                     if (hol.exists()) {
                         Object.values(hol.val() || {}).forEach(h => {
@@ -766,7 +750,11 @@
                 const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
                 const currentMonthWorking = getWorkingDays(startOfMonth, yesterday > startOfMonth ? yesterday : startOfMonth, cachedSettings.weekOffs, cachedSettings.secondSaturday, cachedSettings.holidays, emp.joiningDate);
 
-                const myAttendance = cachedAttData[empId] || {};
+                if (!cachedAttendance.has(empId)) {
+                    const attendance = await get(ref(db, "attendance/" + empId));
+                    cachedAttendance.set(empId, attendance.val() || {});
+                }
+                const myAttendance = cachedAttendance.get(empId);
                 let present = 0, absent = 0, leaves = 0;
 
                 currentMonthWorking.forEach(date => {

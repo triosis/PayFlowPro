@@ -259,21 +259,7 @@
 
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-app.js";
-    const { getDatabase, ref, get, cachedOnValue: onValue, push, set, readView, replayingReads } = await import("./data.js?v=permissions-1").catch(async error => {
-            console.warn("Shared data module unavailable; using Firebase directly.", error);
-            const sdk = await import("./data.js?v=permissions-1");
-            return {
-                ...sdk,
-                get: (...args) => window.AdminLoading.track(sdk.get(...args)),
-                cachedOnValue: (...args) => window.AdminLoading.listen(sdk.onValue, ...args),
-                readView: render => render(),
-                replayingReads: () => false,
-                monthlyRecords: db => Promise.all([
-                    sdk.get(sdk.ref(db, "attendance")),
-                    sdk.get(sdk.ref(db, "salary_approvals"))
-                ])
-            };
-        });
+    const { getDatabase, ref, get, cachedOnValue: onValue, push, set, readView, replayingReads } = await import("./data.js?v=permissions-1");
 
     const firebaseConfig = {
       apiKey: "AIzaSyADjMc3Jwsjlg_ajo282ZtM5jvDUuGdoRk",
@@ -341,9 +327,8 @@
         async function refreshfetchData() {
        const today = new Date().toISOString().split('T')[0];
        
-       const [empSnap, attSnap, leaveSnap, currencySnap] = await Promise.all([
+       const [empSnap, leaveSnap, currencySnap] = await Promise.all([
           get(ref(db, "employees")),
-          get(ref(db, "attendance")),
           get(ref(db, "leaveRequests")),
           get(ref(db, "settings/currencySymbol"))
        ]);
@@ -352,7 +337,6 @@
        if (!replayingReads()) updateSubscription();
 
        const currency = currencySnap.val() || "₹";
-       const allAtt = attSnap.val() || {};
        const employees = [];
        if (empSnap.exists()) {
           empSnap.forEach(c => {
@@ -369,18 +353,28 @@
           });
        }
 
+       const todayRows = [];
+       const fields = ["status","punchIn/time","punchOut/time","currentWorkStatus","dailyPrice"];
+       for (let offset = 0; offset < employees.length; offset += 10) {
+          const batch = employees.slice(offset, offset + 10);
+          const rows = await Promise.all(batch.map(async emp => {
+             const values = await Promise.all(fields.map(field =>
+                get(ref(db, "attendance/" + emp.uid + "/" + today + "/" + field))));
+             return [emp, ...values.map(value => value.val())];
+          }));
+          todayRows.push(...rows);
+       }
+
        let present = 0;
        const tbody = document.getElementById('recentAttendance');
        tbody.innerHTML = "";
 
-       employees.forEach(emp => {
-          const dayData = (allAtt[emp.uid] && allAtt[emp.uid][today]) ? allAtt[emp.uid][today] : {};
-          const status = dayData.status || 'absent';
-          const punchIn = dayData.punchIn?.time || '-';
-          const punchOut = dayData.punchOut?.time || '-';
-          const workStatus = dayData.currentWorkStatus || '-';
-          const price = dayData.dailyPrice || 0;
-          
+       todayRows.forEach(([emp, state, inTime, outTime, work, dailyPrice]) => {
+          const status = state || "absent";
+          const punchIn = inTime || "-";
+          const punchOut = outTime || "-";
+          const workStatus = work || "-";
+          const price = dailyPrice || 0;
           if (status.toLowerCase() === 'in' || status.toLowerCase() === 'out') present++;
 
           tbody.innerHTML += `
@@ -396,6 +390,7 @@
        });
 
        window.openChat = async (empId, empName) => {
+          document.querySelector("#chatModal .close-status-chat")?.click();
           const today = new Date().toISOString().split('T')[0];
           const chatRef = ref(db, `status_chats/${companyId}/${empId}/${today}`);
           
@@ -408,11 +403,11 @@
           const modal = document.createElement('div');
           modal.id = 'chatModal';
           modal.style = "position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); width:90%; max-width:400px; background:var(--bg-card); border:1px solid var(--primary); padding:24px; border-radius:16px; z-index:1000;";
-          modal.innerHTML = `<div style="display:flex; justify-content:space-between; margin-bottom:16px;"><h3>Chat with ${empName}</h3><button onclick="document.body.removeChild(this.parentNode.parentNode)" style="background:transparent; border:none; color:white; cursor:pointer;">✕</button></div>` + chatHtml;
+          modal.innerHTML = `<div style="display:flex; justify-content:space-between; margin-bottom:16px;"><h3>Chat with ${empName}</h3><button type="button" class="close-status-chat" aria-label="Close chat" style="background:transparent; border:none; color:white; cursor:pointer;">✕</button></div>` + chatHtml;
           document.body.appendChild(modal);
 
-          onValue(chatRef, (snap) => {
-             const win = document.getElementById('chatWindow');
+          const stopChat = onValue(chatRef, (snap) => {
+             const win = modal.querySelector('#chatWindow');
              if (!win) return;
              win.innerHTML = "";
              if (snap.exists()) {
@@ -428,6 +423,11 @@
                 });
                 win.scrollTop = win.scrollHeight;
              }
+          });
+
+          modal.querySelector(".close-status-chat").addEventListener("click", () => {
+             stopChat();
+             modal.remove();
           });
 
           window.sendReply = async (eid) => {

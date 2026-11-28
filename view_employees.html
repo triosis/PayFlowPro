@@ -574,21 +574,7 @@
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-app.js";
-        const { getDatabase, ref, cachedOnValue: onValue, get } = await import("./data.js?v=permissions-1").catch(async error => {
-            console.warn("Shared data module unavailable; using Firebase directly.", error);
-            const sdk = await import("./data.js?v=permissions-1");
-            return {
-                ...sdk,
-                get: (...args) => window.AdminLoading.track(sdk.get(...args)),
-                cachedOnValue: (...args) => window.AdminLoading.listen(sdk.onValue, ...args),
-                readView: render => render(),
-                replayingReads: () => false,
-                monthlyRecords: db => Promise.all([
-                    sdk.get(sdk.ref(db, "attendance")),
-                    sdk.get(sdk.ref(db, "salary_approvals"))
-                ])
-            };
-        });
+        const { getDatabase, ref, cachedOnValue: onValue, get, query: dbQuery, orderByKey, startAt, endAt } = await import("./data.js?v=permissions-1");
 
         const firebaseConfig = {
             apiKey: "AIzaSyADjMc3Jwsjlg_ajo282ZtM5jvDUuGdoRk",
@@ -658,7 +644,27 @@
         monthInput.value = `${todayFull.getFullYear()}-${String(todayFull.getMonth() + 1).padStart(2, '0')}`;
         monthInput.onchange = () => renderEmployees();
 
+        let renderVersion = 0;
+        const attendanceReads = new Map();
+        function loadAttendance(id, month, today) {
+            const key = JSON.stringify([id, month, today]);
+            if (!attendanceReads.has(key)) {
+                const path = ref(db, "attendance/" + id);
+                const days = dbQuery(path, orderByKey(), startAt(month + "-01"), endAt(month + "-31"));
+                const todayStatus = today.startsWith(month + "-") ? Promise.resolve(null)
+                    : get(ref(db, "attendance/" + id + "/" + today + "/status"));
+                const request = Promise.all([get(days, month), todayStatus]).then(([records, status]) => {
+                    const result = { ...records.val() };
+                    if (status?.exists()) result[today] = { status: status.val() };
+                    return result;
+                }).catch(error => { attendanceReads.delete(key); throw error; });
+                attendanceReads.set(key, request);
+            }
+            return attendanceReads.get(key);
+        }
+
         window.renderEmployees = async function() {
+            const version = ++renderVersion;
             const dataContainer = document.getElementById('data');
             dataContainer.innerHTML = "<tr><td colspan='5' style='text-align:center; padding:40px;'>Calculating...</td></tr>";
             let filteredCount = 0;
@@ -666,7 +672,7 @@
             
             const selectedMonth = monthInput.value; // YYYY-MM
             const [year, month] = selectedMonth.split('-').map(Number);
-            const monthStr = selectedMonth;
+            if (!selectedMonth) return;
             const now = new Date();
             const isCurrentMonth = now.getFullYear() === year && (now.getMonth() + 1) === month;
             const today = now.toISOString().split('T')[0];
@@ -684,16 +690,29 @@
 
             let htmlString = "";
 
-            if (window.allEmployeesData && window.allEmployeesData.length > 0) {
-                for (const e of window.allEmployeesData) {
-                    const nameMatch = (e.name || '').toLowerCase().includes(query);
-                    const idMatch = (e.empId || '').toLowerCase().includes(query);
-                    
-                    if (query && !nameMatch && !idMatch) continue;
-
-                    const att = window.attendanceData || {};
-                    const empIdSanitized = (e.empId || '').replace(/[.#$\[\]]/g, '_');
-                    const empAtt = att[empIdSanitized] || att[e.empId] || {};
+            const visible = (window.allEmployeesData || []).filter(e =>
+                !query || (e.name || "").toLowerCase().includes(query) ||
+                    (e.empId || "").toLowerCase().includes(query));
+            if (visible.length) {
+                const records = [];
+                try {
+                    for (let offset = 0; offset < visible.length; offset += 15) {
+                        if (version !== renderVersion) return;
+                        const batch = visible.slice(offset, offset + 15);
+                        const rows = await Promise.all(batch.map(async e => {
+                            const id = String(e.empId || e.databaseKey).replace(/[.#$\[\]\/]/g, "_");
+                            const days = await loadAttendance(id, selectedMonth, today);
+                            return [e, days];
+                        }));
+                        records.push(...rows);
+                    }
+                } catch (error) {
+                    if (version === renderVersion) dataContainer.innerHTML = "<tr><td colspan=\"5\">Unable to load attendance.</td></tr>";
+                    console.error(error);
+                    return;
+                }
+                if (version !== renderVersion) return;
+                for (const [e, empAtt] of records) {
                     const todayRecord = empAtt[today] || {};
                     const todayStatus = todayRecord.status || 'absent';
                     const isPresent = todayStatus === 'in' || todayStatus === 'out';
@@ -784,6 +803,7 @@
                         </td>
                     </tr>`;
                 }
+                if (version !== renderVersion) return;
                 dataContainer.innerHTML = htmlString || "<tr><td colspan='5' style='text-align:center; padding:40px; color:var(--text-muted);'>No matching employees found</td></tr>";
             } else {
                 dataContainer.innerHTML = "<tr><td colspan='5' style='text-align:center; padding:40px; color:var(--text-muted);'>No employees found</td></tr>";
@@ -796,10 +816,12 @@
             document.getElementById('stat-leave').innerText = leaveAcc;
         };
 
-        let employeeCount = 0;
-
-        onValue(ref(db, "admins"), adminsSnap => {
-            const branchAdminBranches = new Set();
+        let employeeSnapshot;
+        let adminsLoaded = false;
+        const branchAdminBranches = new Set();
+        const stopAdmins = onValue(ref(db, "admins"), adminsSnap => {
+            adminsLoaded = true;
+            branchAdminBranches.clear();
             if (adminsSnap.exists()) {
                 adminsSnap.forEach(a => {
                     const admin = a.val();
@@ -809,39 +831,47 @@
                 });
             }
 
-            get(ref(db, "attendance")).then(attSnap => {
-                window.attendanceData = attSnap.val() || {};
+            updateEmployees();
+        });
+        const stopEmployees = onValue(ref(db, "employees"), snapshot => {
+            employeeSnapshot = snapshot;
+            attendanceReads.clear();
+            updateEmployees();
+        });
+        window.addEventListener("pagehide", event => {
+            if (!event.persisted) { stopAdmins(); stopEmployees(); }
+        });
 
-                onValue(ref(db, "employees"), s => {
-                    window.allEmployeesData = [];
-                    if (s.exists()) {
-                        s.forEach(c => {
-                            const e = c.val();
-                            let allow = true;
-                            const empBranch = (e.branch || "").trim().toLowerCase();
-                            const empCompanyId = (e.companyId || "").trim().toLowerCase();
-                            const sessionBranch = (adminBranch || "").trim().toLowerCase();
-                            const sessionCompanyId = (companyId || "").trim().toLowerCase();
+        function updateEmployees() {
+            const s = employeeSnapshot;
+            if (!s || !adminsLoaded) return;
+            window.allEmployeesData = [];
+            if (s.exists()) {
+                s.forEach(c => {
+                    const e = c.val();
+                    let allow = true;
+                    const empBranch = (e.branch || "").trim().toLowerCase();
+                    const empCompanyId = (e.companyId || "").trim().toLowerCase();
+                    const sessionBranch = (adminBranch || "").trim().toLowerCase();
+                    const sessionCompanyId = (companyId || "").trim().toLowerCase();
 
-                            const empBranchName = (e.branch || "").trim();
-                            if ((role === 'branch_admin' || role === 'sub_admin') && empBranch !== sessionBranch) {
-                                allow = false;
-                            } else if (role === 'company_admin' && (empCompanyId !== sessionCompanyId || branchAdminBranches.has(empBranchName))) {
-                                allow = false;
-                            } else if (role === 'super_admin' && (empCompanyId !== sessionCompanyId || branchAdminBranches.has(empBranchName))) {
-                                allow = false;
-                            }
-                            if (allow) {
-                                // Skip resigned employees from active employee list
-                                if (window.isResigned && window.isResigned(e)) return;
-                                window.allEmployeesData.push(e);
-                            }
-                        });
+                    const empBranchName = (e.branch || "").trim();
+                    if ((role === 'branch_admin' || role === 'sub_admin') && empBranch !== sessionBranch) {
+                        allow = false;
+                    } else if (role === 'company_admin' && (empCompanyId !== sessionCompanyId || branchAdminBranches.has(empBranchName))) {
+                        allow = false;
+                    } else if (role === 'super_admin' && (empCompanyId !== sessionCompanyId || branchAdminBranches.has(empBranchName))) {
+                        allow = false;
                     }
-                    window.renderEmployees();
-                }); // Close onValue("employees")
-            }); // Close get("attendance")
-        }); // Close onValue("admins")
+                    if (allow) {
+                        // Skip resigned employees from active employee list
+                        if (window.isResigned && window.isResigned(e)) return;
+                        window.allEmployeesData.push({ ...e, databaseKey: c.key });
+                    }
+                });
+            }
+            window.renderEmployees();
+        }
     </script>
     <script>
         // Drag-to-scroll for the table

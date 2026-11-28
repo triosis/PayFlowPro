@@ -794,21 +794,7 @@
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-app.js";
-        const { getDatabase, ref, get, cachedOnValue: onValue, push, update, remove, off, serverTimestamp } = await import("./data.js?v=permissions-1").catch(async error => {
-            console.warn("Shared data module unavailable; using Firebase directly.", error);
-            const sdk = await import("./data.js?v=permissions-1");
-            return {
-                ...sdk,
-                get: (...args) => window.AdminLoading.track(sdk.get(...args)),
-                cachedOnValue: (...args) => window.AdminLoading.listen(sdk.onValue, ...args),
-                readView: render => render(),
-                replayingReads: () => false,
-                monthlyRecords: db => Promise.all([
-                    sdk.get(sdk.ref(db, "attendance")),
-                    sdk.get(sdk.ref(db, "salary_approvals"))
-                ])
-            };
-        });
+        const { getDatabase, ref, get, cachedOnValue: onValue, push, update, remove, query, orderByKey, limitToLast, serverTimestamp } = await import("./data.js?v=permissions-1");
 
         const firebaseConfig = {
             apiKey: "AIzaSyADjMc3Jwsjlg_ajo282ZtM5jvDUuGdoRk",
@@ -835,7 +821,8 @@
         let saving = false;
         let cachedProjects = [];
         let currentProject = null;
-        let currentChatRef = null;
+        let stopChat = null;
+        const chatPageSize = 20;
         let mentionIds = new Set();
         let replyToMessage = null;
         let mediaRecorder = null;
@@ -1524,13 +1511,15 @@
             renderMentionRow();
             window.clearReply();
             $("detailModal").classList.add("show");
+            $("chatMessages").textContent = "Loading messages?";
             listenChat(project.id);
         };
 
         window.closeProjectDetail = function() {
             $("detailModal").classList.remove("show");
-            if (currentChatRef) off(currentChatRef);
-            currentChatRef = null;
+            stopChat?.();
+            stopChat = null;
+            $("chatMessages").replaceChildren();
             currentProject = null;
         };
 
@@ -1579,10 +1568,14 @@
             renderMentionRow();
         };
 
-        function listenChat(projectId) {
-            if (currentChatRef) off(currentChatRef);
-            currentChatRef = ref(db, `timetrack_project_chats/${scopeId}/${projectId}`);
-            onValue(currentChatRef, (snap) => {
+        function listenChat(projectId, limit = chatPageSize) {
+            stopChat?.();
+            const chatRef = ref(db, "timetrack_project_chats/" + scopeId + "/" + projectId);
+            const recent = query(chatRef, orderByKey(), limitToLast(limit));
+            const thread = $("chatMessages");
+            thread.querySelector(".load-older-messages")?.remove();
+            stopChat = onValue(recent, (snap) => {
+                if (currentProject?.id !== projectId) return;
                 const messages = [];
                 if (snap.exists()) {
                     Object.entries(snap.val() || {}).forEach(([id, message]) => {
@@ -1591,6 +1584,14 @@
                 }
                 messages.sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
                 renderChat(messages);
+                if (messages.length >= limit) {
+                    const older = document.createElement("button");
+                    older.type = "button";
+                    older.className = "ghost-button load-older-messages";
+                    older.textContent = "Load older messages";
+                    older.onclick = () => listenChat(projectId, limit + chatPageSize);
+                    thread.prepend(older);
+                }
             });
         }
 
@@ -1687,17 +1688,29 @@
             await pushChatMessage({ type: "text", text });
         };
 
-        $("chatImageInput").addEventListener("change", (event) => {
+        $("chatImageInput").addEventListener("change", async event => {
             const file = event.target.files?.[0];
             event.target.value = "";
-            if (!file) return;
-            const reader = new FileReader();
-            reader.onload = async () => {
-                const result = String(reader.result || "");
-                const base64 = result.split(",").pop();
-                await pushChatMessage({ type: "image", imageData: base64, fileName: file.name });
-            };
-            reader.readAsDataURL(file);
+            const projectId = currentProject?.id;
+            if (!file || !projectId) return;
+            try {
+                const image = await createImageBitmap(file);
+                const scale = Math.min(1, 960 / Math.max(image.width, image.height));
+                const canvas = document.createElement("canvas");
+                canvas.width = Math.max(1, Math.round(image.width * scale));
+                canvas.height = Math.max(1, Math.round(image.height * scale));
+                const context = canvas.getContext("2d");
+                context.fillStyle = "#fff";
+                context.fillRect(0, 0, canvas.width, canvas.height);
+                context.drawImage(image, 0, 0, canvas.width, canvas.height);
+                image.close();
+                const imageData = canvas.toDataURL("image/jpeg", 0.62).split(",")[1];
+                if (currentProject?.id === projectId) {
+                    await pushChatMessage({ type: "image", imageData, fileName: file.name });
+                }
+            } catch (error) {
+                showError("Unable to send image: " + error.message);
+            }
         });
 
         window.toggleVoiceRecord = async function() {
@@ -1709,7 +1722,7 @@
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
                 audioChunks = [];
-                mediaRecorder = new MediaRecorder(stream);
+                mediaRecorder = new MediaRecorder(stream, { audioBitsPerSecond: 48000 });
                 mediaRecorder.ondataavailable = (event) => audioChunks.push(event.data);
                 mediaRecorder.onstop = () => {
                     stream.getTracks().forEach((track) => track.stop());
